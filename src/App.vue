@@ -138,7 +138,7 @@ async function startScanner(cameraId?: string) {
       scannerZoomMin.value = zoom.min;
       scannerZoomMax.value = Math.min(zoom.max, 5);
       scannerZoomStep.value = zoom.step && zoom.step > 0 ? zoom.step : 0.1;
-      scannerZoom.value = Math.min(scannerZoomMax.value, Math.max(scannerZoomMin.value, track.getSettings().zoom ?? zoom.min));
+      scannerZoom.value = Math.min(scannerZoomMax.value, Math.max(scannerZoomMin.value, (track.getSettings() as MediaTrackSettings & { zoom?: number }).zoom ?? zoom.min));
       scannerCanZoom.value = scannerZoomMax.value > scannerZoomMin.value;
     }
     scannerCanTorch.value = capabilities.torch === true || typeof controls.switchTorch === 'function';
