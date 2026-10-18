@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
 import { BrowserMultiFormatReader } from '@zxing/browser';
 import type { IScannerControls } from '@zxing/browser';
+import { cameraCapabilities, applyCameraControl } from './lib/cameraCapabilities';
 import type { FoodProduct, Nutrition } from './lib/types';
 import { analyze } from './lib/analyzer';
 import { fetchProduct, isBarcode } from './lib/openFoodFacts';
@@ -12,6 +13,17 @@ type View = 'home' | 'scanner' | 'label' | 'result' | 'history';
 type LabelSection = 'ingredients' | 'nutrition';
 const view = ref<View>('home');
 const scannerVideo = ref<HTMLVideoElement | null>(null);
+const scannerCameras = ref<MediaDeviceInfo[]>([]);
+const scannerCameraId = ref('');
+const scannerZoom = ref(1);
+const scannerZoomMin = ref(1);
+const scannerZoomMax = ref(1);
+const scannerZoomStep = ref(0.1);
+const scannerCanZoom = ref(false);
+const scannerCanFocus = ref(false);
+const scannerCanTorch = ref(false);
+const scannerTorchOn = ref(false);
+const scannerMessage = ref('');
 const barcode = ref('');
 const busy = ref(false);
 const error = ref('');
@@ -45,6 +57,8 @@ const currentReview = computed(() => product.value ? analyze(product.value) : nu
 const knownNutrients = computed(() => product.value ? nutritionFields.filter(f => product.value!.nutrition[f.key] !== undefined) : []);
 const additiveCodes = computed(() => [...new Set(product.value?.ingredients.match(/\bE\s?\d{3,4}[a-z]?\b/gi)?.map(t => t.replace(/\s+/g,'').toUpperCase()) ?? [])].slice(0, 12));
 let scanControls: IScannerControls | null = null;
+let scannerTrack: MediaStreamTrack | null = null;
+let focusModes: string[] = [];
 let scanningToken = 0;
 let activeWorker: { terminate: () => Promise<unknown> } | null = null;
 
@@ -56,6 +70,8 @@ function stopCamera() {
   scanningToken++;
   scanControls?.stop();
   scanControls = null;
+  scannerTrack = null;
+  scannerTorchOn.value = false;
   isScanning.value = false;
   if (scannerVideo.value?.srcObject) {
     (scannerVideo.value.srcObject as MediaStream).getTracks().forEach(t => t.stop());
@@ -72,25 +88,95 @@ function beginLabel() { navigate('label'); }
 async function beginScan() {
   navigate('scanner');
   await nextTick();
+  await startScanner();
+}
+async function startScanner(cameraId?: string) {
+  stopCamera();
   const token = ++scanningToken;
+  scannerMessage.value = '';
+  error.value = '';
+  scannerCanZoom.value = false;
+  scannerCanFocus.value = false;
+  scannerCanTorch.value = false;
+  scannerCameras.value = [];
   if (!scannerVideo.value) return;
   try {
     isScanning.value = true;
-    const reader = new BrowserMultiFormatReader(undefined, { delayBetweenScanAttempts: 300 });
-    const controls = await reader.decodeFromVideoDevice(undefined, scannerVideo.value, (result, _err, ctrl) => {
-      const code = result?.getText().trim() ?? '';
-      if (code && isBarcode(code) && token === scanningToken) {
-        ctrl.stop();
-        isScanning.value = false;
-        void searchBarcode(code);
+    const reader = new BrowserMultiFormatReader(undefined, { delayBetweenScanAttempts: 260 });
+    const videoConstraints: MediaTrackConstraints = {
+      width: { ideal: 1920 },
+      height: { ideal: 1080 },
+      ...(cameraId ? { deviceId: { exact: cameraId } } : { facingMode: { ideal: 'environment' } })
+    };
+    const controls = await reader.decodeFromConstraints(
+      { video: videoConstraints, audio: false },
+      scannerVideo.value,
+      (result, _err, ctrl) => {
+        const code = result?.getText().trim() ?? '';
+        if (code && isBarcode(code) && token === scanningToken) {
+          ctrl.stop();
+          isScanning.value = false;
+          void searchBarcode(code);
+        }
       }
-    });
-    if (token !== scanningToken) controls.stop();
-    else scanControls = controls;
+    );
+    if (token !== scanningToken) { controls.stop(); return; }
+    scanControls = controls;
+    const track = (scannerVideo.value.srcObject as MediaStream | null)?.getVideoTracks()[0];
+    if (!track) return;
+    scannerTrack = track;
+    const capabilities = cameraCapabilities(track);
+    focusModes = capabilities.focusMode ?? [];
+    scannerCanFocus.value = focusModes.includes('continuous') || focusModes.includes('single-shot');
+    if (focusModes.includes('continuous')) {
+      try { await applyCameraControl(track, 'focusMode', 'continuous'); } catch { /* unsupported */ }
+    }
+    const zoom = capabilities.zoom;
+    if (zoom && zoom.max > zoom.min) {
+      scannerZoomMin.value = zoom.min;
+      scannerZoomMax.value = Math.min(zoom.max, 5);
+      scannerZoomStep.value = zoom.step && zoom.step > 0 ? zoom.step : 0.1;
+      scannerZoom.value = Math.min(scannerZoomMax.value, Math.max(scannerZoomMin.value, track.getSettings().zoom ?? zoom.min));
+      scannerCanZoom.value = scannerZoomMax.value > scannerZoomMin.value;
+    }
+    scannerCanTorch.value = capabilities.torch === true || typeof controls.switchTorch === 'function';
+    try {
+      scannerCameras.value = (await navigator.mediaDevices.enumerateDevices()).filter(device => device.kind === 'videoinput');
+      scannerCameraId.value = track.getSettings().deviceId ?? cameraId ?? '';
+    } catch { scannerCameras.value = []; }
   } catch {
-    isScanning.value = false;
-    error.value = 'Kamera açılamadı. HTTPS, kamera izni veya başka bir uygulamanın kamerayı kullanıp kullanmadığını kontrol edin.';
+    if (token !== scanningToken) return;
+    stopCamera();
+    error.value = 'Kamera açılamadı. İzinleri kontrol edin veya başka bir kamera ile deneyin.';
   }
+}
+function selectScannerCamera(event: Event) {
+  scannerCameraId.value = (event.target as HTMLSelectElement).value;
+  void startScanner(scannerCameraId.value);
+}
+async function adjustScannerZoom(event: Event) {
+  if (!scannerTrack) return;
+  const zoom = Number((event.target as HTMLInputElement).value);
+  if (!Number.isFinite(zoom)) return;
+  try { await applyCameraControl(scannerTrack, 'zoom', zoom); scannerZoom.value = zoom; }
+  catch { scannerMessage.value = 'Bu cihazda yakınlaştırma kullanılamıyor.'; }
+}
+async function refocusScanner() {
+  if (!scannerTrack || !scannerCanFocus.value) return;
+  const mode = focusModes.includes('single-shot') ? 'single-shot' : 'continuous';
+  try {
+    await applyCameraControl(scannerTrack, 'focusMode', mode);
+    scannerMessage.value = 'Odak isteği gönderildi. Barkodu biraz uzaklaştırarak deneyin.';
+  } catch { scannerMessage.value = 'Tarayıcı odak isteğini kabul etmedi.'; }
+}
+async function toggleScannerTorch() {
+  if (!scannerTrack || !scannerCanTorch.value) return;
+  const desired = !scannerTorchOn.value;
+  try {
+    if (scanControls?.switchTorch) await scanControls.switchTorch(desired);
+    else await applyCameraControl(scannerTrack, 'torch', desired);
+    scannerTorchOn.value = desired;
+  } catch { scannerMessage.value = 'Flaş kontrolü kullanılamıyor.'; }
 }
 async function showProduct(p: FoodProduct) {
   product.value = p;
@@ -275,7 +361,23 @@ onBeforeUnmount(() => {
         <div class="page-eyebrow">01 / BARKOD TARAMA</div>
         <h1>Barkodu <em>kadrajla.</em></h1>
         <p class="page-lead">Ürünün ambalajındaki barkodu çerçevenin içine yerleştir.</p>
-        <div class="scanner-frame"><video ref="scannerVideo" autoplay muted playsinline aria-label="Barkod kamerası"></video><div class="scanner-reticle"><i></i><i></i><i></i><i></i></div><span v-if="isScanning" class="scanner-caption">Barkod aranıyor…</span></div>
+        <div class="scanner-frame" @click="refocusScanner"><video ref="scannerVideo" autoplay muted playsinline aria-label="Barkod kamerası"></video><div class="scanner-reticle"><i></i><i></i><i></i><i></i></div><span v-if="isScanning" class="scanner-caption">Barkod aranıyor…</span></div>
+        <div class="scanner-tools" v-if="isScanning">
+          <label v-if="scannerCameras.length > 1" class="scanner-camera-label">Kamera
+            <select :value="scannerCameraId" @change="selectScannerCamera">
+              <option v-for="(camera, i) in scannerCameras" :key="camera.deviceId" :value="camera.deviceId">{{ camera.label || 'Kamera ' + (i + 1) }}</option>
+            </select>
+          </label>
+          <label v-if="scannerCanZoom" class="scanner-zoom-label">Yakınlaştırma <strong>{{ scannerZoom.toFixed(1) }}×</strong>
+            <input type="range" :min="scannerZoomMin" :max="scannerZoomMax" :step="scannerZoomStep" :value="scannerZoom" @input="adjustScannerZoom"/>
+          </label>
+          <div class="scanner-tool-buttons">
+            <button v-if="scannerCanFocus" type="button" @click="refocusScanner">◎ Yeniden odakla</button>
+            <button v-if="scannerCanTorch" type="button" @click="toggleScannerTorch">{{ scannerTorchOn ? '✦ Flaş kapat' : '✦ Flaş aç' }}</button>
+          </div>
+        </div>
+        <p v-if="scannerMessage" class="center-text" role="status">{{ scannerMessage }}</p>
+        <p class="center-text">Çok yakına getirmek yerine 15–25 cm uzaktan netleştirin; gerekiyorsa yakınlaştırın.</p>
         <p v-if="error" class="message error" role="alert">{{ error }}</p>
         <p class="center-text">Kamera erişimi için HTTPS ve tarayıcı izni gerekir.</p>
         <button class="outlined full" @click="beginLabel">Barkod yok mu? Etiket fotoğrafla →</button>
