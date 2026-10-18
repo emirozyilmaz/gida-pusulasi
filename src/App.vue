@@ -13,6 +13,8 @@ type View = 'home' | 'scanner' | 'label' | 'result' | 'history';
 type LabelSection = 'ingredients' | 'nutrition';
 const view = ref<View>('home');
 const scannerVideo = ref<HTMLVideoElement | null>(null);
+const scannerPhotoInput = ref<HTMLInputElement | null>(null);
+const scannerPhotoBusy = ref(false);
 const scannerCameras = ref<MediaDeviceInfo[]>([]);
 const scannerCameraId = ref('');
 const scannerZoom = ref(1);
@@ -177,6 +179,36 @@ async function toggleScannerTorch() {
     else await applyCameraControl(scannerTrack, 'torch', desired);
     scannerTorchOn.value = desired;
   } catch { scannerMessage.value = 'Flaş kontrolü kullanılamıyor.'; }
+}
+function openScannerPhoto() {
+  stopCamera();
+  error.value = '';
+  scannerPhotoInput.value?.click();
+}
+async function decodeScannerPhoto(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = '';
+  if (!file) return;
+  if (!file.type.startsWith('image/')) {
+    error.value = 'Lütfen bir barkod fotoğrafı seçin.';
+    return;
+  }
+  scannerPhotoBusy.value = true;
+  error.value = '';
+  const url = URL.createObjectURL(file);
+  try {
+    const reader = new BrowserMultiFormatReader();
+    const result = await reader.decodeFromImageUrl(url);
+    const code = result.getText().trim();
+    if (!isBarcode(code)) throw new Error('Barkod formatı geçersiz.');
+    await searchBarcode(code);
+  } catch {
+    error.value = 'Fotoğraf okunamadı. Barkodu net, tam ve düz kadrajla çekin veya kamerayı yeniden başlatın.';
+  } finally {
+    URL.revokeObjectURL(url);
+    scannerPhotoBusy.value = false;
+  }
 }
 async function showProduct(p: FoodProduct) {
   product.value = p;
@@ -379,7 +411,10 @@ onBeforeUnmount(() => {
         <p v-if="scannerMessage" class="center-text" role="status">{{ scannerMessage }}</p>
         <p class="center-text">Çok yakına getirmek yerine 15–25 cm uzaktan netleştirin; gerekiyorsa yakınlaştırın.</p>
         <p v-if="error" class="message error" role="alert">{{ error }}</p>
-        <p class="center-text">Kamera erişimi için HTTPS ve tarayıcı izni gerekir.</p>
+        <input ref="scannerPhotoInput" class="sr-only" type="file" accept="image/*" capture="environment" @change="decodeScannerPhoto" />
+        <button class="submit-primary scanner-photo" type="button" :disabled="scannerPhotoBusy" @click="openScannerPhoto">{{ scannerPhotoBusy ? 'Fotoğraf inceleniyor…' : '📷 Telefon kamerasıyla barkodu fotoğrafla' }}</button>
+        <button v-if="!isScanning && !scannerPhotoBusy" class="outlined full" type="button" @click="startScanner(scannerCameraId || undefined)">↻ Canlı kamerayı yeniden başlat</button>
+        <p class="center-text">Kamera erişimi için HTTPS ve tarayıcı izni gerekir. Fotoğraflar cihazda incelenir.</p>
         <button class="outlined full" @click="beginLabel">Barkod yok mu? Etiket fotoğrafla →</button>
       </section>
 
